@@ -149,14 +149,63 @@ def ambil_jadwal_rutin_berikutnya() -> str:
 
 
 # ==============================================================================
-# 3. FUNGSI DATABASE (SQLite) & DATA CONTOH (SEED)
+# 3. FUNGSI DATABASE (SQLite), AUTO-SYNC MULTI-DEVICE, & DATA CONTOH (SEED)
 # ==============================================================================
 
 def get_connection():
-    """Membuka koneksi ke database SQLite lokal."""
-    conn = sqlite3.connect(DB_FILE)
+    """Membuka koneksi ke database SQLite lokal dengan timeout agar aman dipakai banyak device bersamaan."""
+    conn = sqlite3.connect(DB_FILE, timeout=15)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def hitung_fingerprint_db() -> str:
+    """
+    Menghitung sidik jari (fingerprint) isi database saat ini.
+    Jika ada device lain yang menambah laporan, menukar poin, atau memverifikasi Posyandu,
+    nilai fingerprint ini akan berubah sehingga layar di device ini otomatis me-refresh sendiri.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*), COALESCE(SUM(poin), 0), COALESCE(SUM(streak), 0) FROM users")
+    u = tuple(cur.fetchone())
+    cur.execute("SELECT COUNT(*) FROM laporan_harian")
+    l = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM kunjungan_posyandu")
+    k = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*), COALESCE(GROUP_CONCAT(status_ambil), '') FROM riwayat_penukaran")
+    r = tuple(cur.fetchone())
+    cur.execute("SELECT COUNT(*), COALESCE(GROUP_CONCAT(status), '') FROM panggilan_posyandu")
+    p = tuple(cur.fetchone())
+    conn.close()
+    return f"{u}-{l}-{k}-{r}-{p}"
+
+
+def pasang_auto_sync_antar_device():
+    """
+    Memantau perubahan database setiap 3 detik di latar belakang (tanpa mengganggu ketikan form).
+    Begitu ada perubahan data dari device lain, halaman langsung di-rerun otomatis!
+    """
+    if "db_fingerprint" not in st.session_state:
+        st.session_state["db_fingerprint"] = hitung_fingerprint_db()
+
+    if not st.session_state.get("auto_sync_device", True):
+        return
+
+    if hasattr(st, "fragment"):
+        @st.fragment(run_every="3s")
+        def _watcher_Perubahan_db():
+            fp_terbaru = hitung_fingerprint_db()
+            if fp_terbaru != st.session_state.get("db_fingerprint"):
+                st.session_state["db_fingerprint"] = fp_terbaru
+                st.rerun()
+
+        _watcher_Perubahan_db()
+
+
+def update_fingerprint_lokal():
+    """Memperbarui catatan fingerprint setelah device ini sendiri yang menyimpan data."""
+    st.session_state["db_fingerprint"] = hitung_fingerprint_db()
 
 
 def init_db():
@@ -378,6 +427,7 @@ def registrasi_ibu(nama_ibu: str, password: str, nama_anak: str, tgl_lahir: date
             VALUES (?, ?, ?, ?, ?, 0, 0)
         """, (nama_ibu, hash_password(password), nama_anak, tgl_lahir_str, no_akta))
         conn.commit()
+        update_fingerprint_lokal()
         return True, "Registrasi berhasil! Silakan masuk menggunakan akun Bunda."
     except sqlite3.IntegrityError:
         return False, "Nama Ibu atau Nomor Akta Kelahiran sudah terdaftar."
@@ -481,6 +531,7 @@ def simpan_laporan_harian(user_id: int, sehat: str, makan: str, tidur: str, cata
 
     conn.commit()
     conn.close()
+    update_fingerprint_lokal()
 
     pesan = f"Laporan disimpan! Bunda mendapat +{POIN_LAPOR_HARIAN} poin."
     if dapat_bonus:
@@ -510,6 +561,7 @@ def tukar_hadiah(user_id: int, nama_hadiah: str, harga_poin: int):
 
     conn.commit()
     conn.close()
+    update_fingerprint_lokal()
     return True, f"Berhasil menukar '{nama_hadiah}' (-{harga_poin} poin). Kode Klaim Rahasia: {kode_klaim_acak} (Hanya Bunda & Kader Posyandu yang tahu kode ini)."
 
 
@@ -527,6 +579,7 @@ def verifikasi_redeem_kader(penukaran_id: int, status_baru: str = "Sudah Diberik
     )
     conn.commit()
     conn.close()
+    update_fingerprint_lokal()
     return True, f"Status klaim {kode_tampil} berhasil diubah menjadi: {status_baru}!"
 
 
@@ -572,6 +625,7 @@ def simpan_kunjungan_posyandu(
 
     conn.commit()
     conn.close()
+    update_fingerprint_lokal()
     return True, f"Data Posyandu ({jenis_kunjungan}) disimpan! Ibu mendapat +{poin_tambahan} poin."
 
 
@@ -589,6 +643,7 @@ def buat_panggilan_posyandu(user_id: int, tgl_panggilan: date, alasan: str):
     """, (user_id, tgl_panggilan.isoformat(), alasan, POIN_KUNJUNGAN_LUAR_JADWAL))
     conn.commit()
     conn.close()
+    update_fingerprint_lokal()
     return True, f"Panggilan luar jadwal berhasil dikirim ke akun Ibu (Bonus +{POIN_KUNJUNGAN_LUAR_JADWAL} poin saat hadir)!"
 
 
@@ -611,6 +666,7 @@ def verifikasi_hadir_panggilan_kader(panggilan_id: int):
     cur.execute("UPDATE users SET poin = poin + ? WHERE id = ?", (poin_bonus, panggilan["user_id"]))
     conn.commit()
     conn.close()
+    update_fingerprint_lokal()
     return True, f"Kehadiran luar jadwal diverifikasi! Ibu mendapat tambahan +{poin_bonus} poin."
 
 
@@ -637,6 +693,7 @@ def dev_reset_laporan_hari_ini(user_id: int):
         """, (row["poin_didapat"], kemarin_str, user_id))
         conn.commit()
         conn.close()
+        update_fingerprint_lokal()
         return True, f"Laporan tanggal {tgl_str} berhasil di-reset!"
     conn.close()
     return False, f"Belum ada laporan pada tanggal {tgl_str}."
@@ -655,6 +712,7 @@ def dev_reset_seluruh_database():
     isi_data_contoh(cur)
     conn.commit()
     conn.close()
+    update_fingerprint_lokal()
 
 
 def tampilkan_kalender_pengingat(user_id: int):
@@ -741,9 +799,19 @@ def tampilkan_panel_samping_dan_devtools():
     """
     Panel tambahan di Sidebar untuk:
     1. Auto Dark Mode (berdasarkan jam lokal) + Toggle Manual Tema
-    2. Developer Tools (ganti hari/tanggal simulasi, reset laporan, tambah poin/streak, reset DB untuk demo)
+    2. Sinkronisasi Real-Time Antar Device
+    3. Developer Tools (ganti hari/tanggal simulasi, reset laporan, tambah poin/streak, reset DB untuk demo)
     """
     with st.sidebar:
+        st.markdown("### 🔄 Sinkronisasi Multi-Device")
+        st.toggle(
+            "Auto-Update Real-Time (3 dtk)",
+            value=True,
+            key="auto_sync_device",
+            help="Jika aktif, perubahan data dari HP/device lain akan otomatis memperbarui layar ini tanpa perlu refresh manual.",
+        )
+
+        st.divider()
         st.markdown("### 🎨 Tema Tampilan")
         jam_sekarang = jam_lokal_aktif()
         status_waktu = "Malam (Auto Gelap)" if (jam_sekarang >= 18 or jam_sekarang < 6) else "Siang (Auto Terang)"
@@ -806,6 +874,7 @@ def tampilkan_panel_samping_dan_devtools():
                     conn.execute("UPDATE users SET streak = 6, tgl_lapor_terakhir = ? WHERE id = ?", (kemarin_str, uid))
                     conn.commit()
                     conn.close()
+                    update_fingerprint_lokal()
                     st.toast("Streak diset ke 6 hari! Silakan isi laporan untuk demo bonus 7 hari.", icon="🔥")
                     st.rerun()
             with k_poin:
@@ -814,6 +883,7 @@ def tampilkan_panel_samping_dan_devtools():
                     conn.execute("UPDATE users SET poin = poin + 500 WHERE id = ?", (uid,))
                     conn.commit()
                     conn.close()
+                    update_fingerprint_lokal()
                     st.toast("Berhasil menambah +500 poin!", icon="⭐")
                     st.rerun()
 
@@ -1409,10 +1479,13 @@ def main():
         st.session_state["dev_offset_hari"] = 0
     if "mode_tema" not in st.session_state:
         st.session_state["mode_tema"] = "Otomatis (Jam Lokal)"
+    if "auto_sync_device" not in st.session_state:
+        st.session_state["auto_sync_device"] = True
 
     init_db()
     tampilkan_panel_samping_dan_devtools()
     pasang_css_kustom()
+    pasang_auto_sync_antar_device()
 
     if st.session_state["peran_login"] == "ibu":
         halaman_utama_ibu()
